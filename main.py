@@ -1,10 +1,13 @@
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from pydantic import BaseModel   
 from typing import Optional, List 
 from datetime import datetime, timedelta
 import database
+from fpdf import FPDF
+from fastapi.responses import Response
 
 app = FastAPI(title="Lakshmi Narasimha Hallmarking API")
 
@@ -22,7 +25,6 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-# This is your Master Login. Change the password here if you want!
 VALID_USERNAME = "admin"
 VALID_PASSWORD = "admin123"
 SECRET_TOKEN = "lnhc-secure-token-2026"
@@ -33,29 +35,33 @@ def login(req: LoginRequest):
         return {"access_token": SECRET_TOKEN}
     raise HTTPException(status_code=401, detail="Invalid username or password")
 
-# This is the "Lock" that protects the rest of the app
 def verify_token(authorization: Optional[str] = Header(None)):
     if not authorization or authorization != f"Bearer {SECRET_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized access. Please log in.")
     return True
-# -----------------------
 
+# --- PYDANTIC SCHEMAS ---
 class ItemInput(BaseModel):
     description: str; quantity: int; purity: str; weight: float
 
 class JobCardInput(BaseModel):
     customer_id: int; request_number: str; items: List[ItemInput]
+    custom_date: Optional[str] = None
 
 class ItemGrading(BaseModel):
     item_id: int; hm: int; rej: int; melt: int; rtn: int
 
 class BillPayload(BaseModel):
     customer_id: int; request_number: str; results: List[ItemGrading]
+    custom_date: Optional[str] = None
 
 class ItemUpdate(BaseModel):
     description: str; quantity: int; purity: str; weight: float
 
-# Notice the new `Depends(verify_token)` on every route below!
+class NewItemCreate(BaseModel):
+    description: str; quantity: int; purity: str; weight: float
+
+# --- CUSTOMER ENDPOINTS ---
 @app.post("/customers/")
 def create_customer(business_name: str, phone: str, address: str, license_number: str, gstin: Optional[str] = None, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
     new_customer = database.Customer(business_name=business_name, phone=phone, address=address, license_number=license_number, gstin=gstin)
@@ -66,11 +72,31 @@ def create_customer(business_name: str, phone: str, address: str, license_number
 
 @app.get("/customers/")
 def get_all_customers(db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
-    return db.query(database.Customer).all()
+    return db.query(database.Customer).order_by(database.Customer.business_name.asc()).all()
 
+@app.delete("/customers/{customer_id}")
+def delete_customer(customer_id: int, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+    customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Jeweler not found.")
+
+    existing_jobs = db.query(database.JobCard).filter(database.JobCard.customer_id == customer_id).first()
+    if existing_jobs:
+        raise HTTPException(status_code=400, detail="Cannot delete this Jeweler because they have existing Job Cards or Bills in the system.")
+
+    db.delete(customer)
+    db.commit()
+    return {"message": "Jeweler deleted successfully"}
+
+# --- JOB CARD ENDPOINTS ---
 @app.post("/jobcards/")
 def create_job_card(data: JobCardInput, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
-    new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number)
+    final_date = datetime.utcnow()
+    if data.custom_date:
+        try: final_date = datetime.strptime(data.custom_date, "%Y-%m-%dT%H:%M")
+        except ValueError: pass
+
+    new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number, date_received=final_date)
     db.add(new_job)
     db.commit()
     db.refresh(new_job)
@@ -103,20 +129,41 @@ def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db), s
     db.commit()
     return {"message": "Item updated successfully"}
 
+@app.post("/add_item_to_request/{request_number}")
+def add_item_to_request(request_number: str, item: NewItemCreate, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+    job = db.query(database.JobCard).filter(database.JobCard.request_number == request_number).first()
+    if not job: raise HTTPException(status_code=404, detail="Job not found")
+    
+    new_item = database.JobItem(job_card_id=job.id, item_description=item.description, quantity=item.quantity, weight_grams=item.weight, declared_purity=item.purity)
+    db.add(new_item)
+    db.commit()
+    return {"message": "Item added successfully"}
+
 @app.delete("/delete_request/{request_no}")
 def delete_request(request_no: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
     pending_jobs = db.query(database.JobCard).filter(database.JobCard.request_number == request_no, database.JobCard.status == "Pending").all()
     if not pending_jobs: raise HTTPException(status_code=404, detail="Pending request not found")
+    
     for job in pending_jobs:
         db.query(database.JobItem).filter(database.JobItem.job_card_id == job.id).delete()
         db.delete(job)
     db.commit()
-    return {"message": "Request completely deleted"}
+    
+    # MAGIC TRICK: Force sequence recalculation after delete
+    db.execute(text("SELECT setval(pg_get_serial_sequence('job_cards', 'id'), coalesce(max(id), 1), max(id) IS NOT null) FROM job_cards;"))
+    db.commit()
+    return {"message": "Request deleted and sequence reset"}
 
+# --- INVOICE ENDPOINTS ---
 @app.post("/generate_invoice/")
 def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
     pending_jobs = db.query(database.JobCard).filter(database.JobCard.customer_id == payload.customer_id, database.JobCard.request_number == payload.request_number, database.JobCard.status == "Pending").all()
     if not pending_jobs: raise HTTPException(status_code=404, detail="No pending jobs for this Request Number.")
+
+    final_date = datetime.utcnow()
+    if payload.custom_date:
+        try: final_date = datetime.strptime(payload.custom_date, "%Y-%m-%dT%H:%M")
+        except ValueError: pass
 
     total_pieces = 0
     for res in payload.results:
@@ -128,7 +175,7 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), secure
     calculated_amount = total_pieces * 45.0
     final_amount = max(calculated_amount, 200.0)
     
-    new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount)
+    new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount, created_at=final_date)
     db.add(new_invoice)
     db.commit(); db.refresh(new_invoice)
     
@@ -163,7 +210,7 @@ def print_invoice(invoice_id: int, db: Session = Depends(get_db), secure: bool =
 
     for job in billed_jobs:
         if job.request_number: request_numbers.append(job.request_number)
-        items = db.query(database.JobItem).filter(database.JobItem.job_card_id == job.id).all()
+        items = db.query(database.JobItem).filter(database.JobItem.job_card_id == job.id).order_by(database.JobItem.id.asc()).all()
         for i in items: item_list.append({"description": i.item_description, "purity": i.declared_purity, "quantity": i.quantity, "hm": i.hm, "rej": i.rej, "melt": i.melt, "rtn": i.rtn})
 
     return {
@@ -173,10 +220,11 @@ def print_invoice(invoice_id: int, db: Session = Depends(get_db), secure: bool =
         "total_amount": round(invoice.total_amount or 0, 2), "items": item_list 
     }
 
+# --- REPORTS ---
 @app.get("/report/{customer_id}")
 def generate_report(customer_id: int, start_date: str, end_date: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
     start = datetime.strptime(start_date, "%Y-%m-%d"); end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
-    invoices = db.query(database.Invoice).filter(database.Invoice.customer_id == customer_id, database.Invoice.created_at >= start, database.Invoice.created_at <= end).all()
+    invoices = db.query(database.Invoice).filter(database.Invoice.customer_id == customer_id, database.Invoice.created_at >= start, database.Invoice.created_at <= end).order_by(database.Invoice.created_at.asc()).all()
     customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
     cust_name = customer.business_name if customer else "Unknown"
     
