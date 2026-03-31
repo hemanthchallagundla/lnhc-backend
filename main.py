@@ -10,6 +10,10 @@ from fpdf import FPDF
 from fastapi.responses import Response
 
 app = FastAPI(title="Lakshmi Narasimha Hallmarking API")
+# --- KEEP AWAKE WIDGET ---
+@app.get("/")
+def health_check():
+    return {"status": "awake and ready"}
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
