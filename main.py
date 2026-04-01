@@ -6,10 +6,10 @@ from pydantic import BaseModel
 from typing import Optional, List 
 from datetime import datetime, timedelta
 import database
-from fpdf import FPDF
 from fastapi.responses import Response
 
 app = FastAPI(title="Lakshmi Narasimha Hallmarking API")
+
 # --- KEEP AWAKE WIDGET ---
 @app.get("/")
 def health_check():
