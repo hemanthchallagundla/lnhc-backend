@@ -100,15 +100,24 @@ def create_job_card(data: JobCardInput, db: Session = Depends(get_db), secure: b
         try: final_date = datetime.strptime(data.custom_date, "%Y-%m-%dT%H:%M")
         except ValueError: pass
 
-    new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number, date_received=final_date)
+    # 1. Calculate Daily Receipt Number (e.g. C-01042026-1)
+    start_of_day = final_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = final_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+    daily_count = db.query(database.JobCard).filter(database.JobCard.date_received >= start_of_day, database.JobCard.date_received <= end_of_day).count()
+    seq = daily_count + 1
+    receipt_no_str = f"C-{final_date.strftime('%d%m%Y')}-{seq}"
+
+    new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number, date_received=final_date, receipt_no=receipt_no_str)
     db.add(new_job)
     db.commit()
     db.refresh(new_job)
+    
     for item in data.items:
         new_item = database.JobItem(job_card_id=new_job.id, item_description=item.description, quantity=item.quantity, declared_purity=item.purity, weight_grams=item.weight)
         db.add(new_item)
     db.commit()
-    return {"job_card_id": new_job.id, "request_number": new_job.request_number, "message": "Saved."}
+    
+    return {"job_card_id": new_job.id, "receipt_no": new_job.receipt_no, "request_number": new_job.request_number, "message": "Saved."}
 
 @app.get("/pending_requests/{customer_id}")
 def get_pending_requests(customer_id: int, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
@@ -153,7 +162,6 @@ def delete_request(request_no: str, db: Session = Depends(get_db), secure: bool 
         db.delete(job)
     db.commit()
     
-    # MAGIC TRICK: Force sequence recalculation after delete
     db.execute(text("SELECT setval(pg_get_serial_sequence('job_cards', 'id'), coalesce(max(id), 1), max(id) IS NOT null) FROM job_cards;"))
     db.commit()
     return {"message": "Request deleted and sequence reset"}
@@ -168,6 +176,13 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), secure
     if payload.custom_date:
         try: final_date = datetime.strptime(payload.custom_date, "%Y-%m-%dT%H:%M")
         except ValueError: pass
+    
+    # 1. Calculate Daily Bill Number (e.g. INV-01042026-1)
+    start_of_day = final_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = final_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+    daily_count = db.query(database.Invoice).filter(database.Invoice.created_at >= start_of_day, database.Invoice.created_at <= end_of_day).count()
+    seq = daily_count + 1
+    bill_no_str = f"INV-{final_date.strftime('%d%m%Y')}-{seq}"
 
     total_pieces = 0
     for res in payload.results:
@@ -179,29 +194,37 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), secure
     calculated_amount = total_pieces * 45.0
     final_amount = max(calculated_amount, 200.0)
     
-    new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount, created_at=final_date)
+    new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount, created_at=final_date, bill_no=bill_no_str)
     db.add(new_invoice)
     db.commit(); db.refresh(new_invoice)
     
     for job in pending_jobs:
         job.invoice_id = new_invoice.id; job.status = "Billed"
     db.commit() 
-    return {"invoice_number": new_invoice.id, "total_bill": final_amount}
+    return {"invoice_number": new_invoice.id, "bill_no": new_invoice.bill_no, "total_bill": final_amount}
 
 @app.get("/find_invoice_by_request/{request_no}")
 def find_invoice_by_request(request_no: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
     job = db.query(database.JobCard).filter(database.JobCard.request_number == request_no).first()
     if not job or not job.invoice_id: raise HTTPException(status_code=404, detail="No billed invoice found for this Request No.")
-    return {"invoice_id": job.invoice_id}
+    
+    invoice = db.query(database.Invoice).filter(database.Invoice.id == job.invoice_id).first()
+    bill_display = invoice.bill_no if invoice.bill_no else str(invoice.id)
+    return {"invoice_id": bill_display}
 
-@app.get("/print_invoice/{invoice_id}")
-def print_invoice(invoice_id: int, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
-    invoice = db.query(database.Invoice).filter(database.Invoice.id == invoice_id).first()
+@app.get("/print_invoice/{invoice_identifier}")
+def print_invoice(invoice_identifier: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+    # Safely handles both new string IDs (INV-...) and old integer IDs (1, 2, 3...)
+    invoice = db.query(database.Invoice).filter(database.Invoice.bill_no == invoice_identifier).first()
+    if not invoice and invoice_identifier.isdigit():
+        invoice = db.query(database.Invoice).filter(database.Invoice.id == int(invoice_identifier)).first()
+        
     if not invoice: raise HTTPException(status_code=404, detail="Invoice not found")
+    
     customer = db.query(database.Customer).filter(database.Customer.id == invoice.customer_id).first()
 
     item_list = []; request_numbers = []
-    billed_jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == invoice_id).order_by(database.JobCard.date_received.asc()).all()
+    billed_jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == invoice.id).order_by(database.JobCard.date_received.asc()).all()
     
     def to_ist(utc_dt):
         if not utc_dt: return datetime.now()
@@ -217,8 +240,10 @@ def print_invoice(invoice_id: int, db: Session = Depends(get_db), secure: bool =
         items = db.query(database.JobItem).filter(database.JobItem.job_card_id == job.id).order_by(database.JobItem.id.asc()).all()
         for i in items: item_list.append({"description": i.item_description, "purity": i.declared_purity, "quantity": i.quantity, "hm": i.hm, "rej": i.rej, "melt": i.melt, "rtn": i.rtn})
 
+    bill_no_display = invoice.bill_no if invoice.bill_no else f"#00{invoice.id}"
+
     return {
-        "invoice_no": invoice.id, "job_date_time": job_time_ist, "bill_date_time": bill_time_ist,
+        "invoice_no": bill_no_display, "job_date_time": job_time_ist, "bill_date_time": bill_time_ist,
         "customer_name": customer.business_name or "Unknown", "customer_address": customer.address or "", 
         "customer_license": customer.license_number or "", "request_numbers": ", ".join(set(request_numbers)),
         "total_amount": round(invoice.total_amount or 0, 2), "items": item_list 
@@ -242,8 +267,9 @@ def generate_report(customer_id: int, start_date: str, end_date: str, db: Sessio
             for i in items:
                 pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
         item_details_str = ", ".join(item_descriptions)
-            
-        report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": inv.id, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
+        
+        bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
+        report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
         grand_total += inv.total_amount; total_pieces += pcs
         
     return { "customer_name": cust_name, "report_data": report_data, "grand_total": round(grand_total, 2), "total_items": total_pieces }
@@ -265,8 +291,9 @@ def generate_master_report(start_date: str, end_date: str, db: Session = Depends
             for i in items:
                 pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
         item_details_str = ", ".join(item_descriptions)
-            
-        report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": inv.id, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
+        
+        bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
+        report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
         grand_total += inv.total_amount; total_pieces += pcs
         
     return { "customer_name": "ALL JEWELERS (MASTER REPORT)", "report_data": report_data, "grand_total": round(grand_total, 2), "total_items": total_pieces }
