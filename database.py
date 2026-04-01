@@ -26,6 +26,7 @@ class Invoice(Base):
     taxable_amount = Column(Float)
     total_amount = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow)
+    bill_no = Column(String, nullable=True)
 
 class JobCard(Base):
     __tablename__ = "job_cards"
@@ -35,6 +36,7 @@ class JobCard(Base):
     request_number = Column(String, index=True, nullable=True)
     status = Column(String, default="Pending") 
     date_received = Column(DateTime, default=datetime.utcnow)
+    receipt_no = Column(String, nullable=True)
 
 class JobItem(Base):
     __tablename__ = "job_items"
