@@ -48,6 +48,13 @@ def verify_token(authorization: Optional[str] = Header(None)):
 class ItemInput(BaseModel):
     description: str; quantity: int; purity: str; weight: float
 
+class CustomerUpdate(BaseModel):
+    business_name: str
+    phone: str
+    address: str
+    license_number: str
+    gstin: Optional[str] = None
+
 class JobCardInput(BaseModel):
     customer_id: int; request_number: str; items: List[ItemInput]
     custom_date: Optional[str] = None
@@ -77,6 +84,22 @@ def create_customer(business_name: str, phone: str, address: str, license_number
 @app.get("/customers/")
 def get_all_customers(db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
     return db.query(database.Customer).order_by(database.Customer.business_name.asc()).all()
+
+@app.put("/customers/{customer_id}")
+def update_customer(customer_id: int, data: CustomerUpdate, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+    customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Jeweler not found")
+    
+    # Update all the fields
+    customer.business_name = data.business_name
+    customer.phone = data.phone
+    customer.address = data.address
+    customer.license_number = data.license_number
+    customer.gstin = data.gstin
+    
+    db.commit()
+    return {"message": "Jeweler updated successfully"}
 
 @app.delete("/customers/{customer_id}")
 def delete_customer(customer_id: int, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
