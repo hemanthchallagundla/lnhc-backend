@@ -5,7 +5,14 @@ from datetime import datetime
 # Your live Neon PostgreSQL database connection!
 SQLALCHEMY_DATABASE_URL = "postgresql://neondb_owner:npg_5qWFMUNe2QoE@ep-rough-smoke-a1bn3tx2-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+# We are adding pool pre-ping and recycling to handle Neon's serverless connection drops
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    pool_pre_ping=True,      # Tests the connection before using it
+    pool_recycle=300,        # Automatically recycles connections older than 5 minutes
+    pool_size=5,             # Keeps a small, healthy pool of connections
+    max_overflow=10          # Allows a few extra connections during traffic spikes
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
