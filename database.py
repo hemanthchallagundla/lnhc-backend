@@ -14,7 +14,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- NEW: USERS TABLE ---
+# --- THE MISSING APP_USERS TABLE ---
 class AppUser(Base):
     __tablename__ = "app_users"
     id = Column(Integer, primary_key=True, index=True)
