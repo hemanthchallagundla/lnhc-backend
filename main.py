@@ -6,11 +6,11 @@ from pydantic import BaseModel
 from typing import Optional, List 
 from datetime import datetime, timedelta
 import database
+import secrets
 from fastapi.responses import Response
 
 app = FastAPI(title="Lakshmi Narasimha Hallmarking API")
 
-# --- KEEP AWAKE WIDGET ---
 @app.get("/")
 def health_check():
     return {"status": "awake and ready"}
@@ -24,47 +24,88 @@ def get_db():
     try: yield db
     finally: db.close()
 
-# --- SECURITY MODULE ---
+# --- STARTUP EVENT (Creates the Master Admin) ---
+@app.on_event("startup")
+def startup_event():
+    db = database.SessionLocal()
+    admin_exists = db.query(database.AppUser).filter(database.AppUser.role == "admin").first()
+    if not admin_exists:
+        default_admin = database.AppUser(username="admin", password="admin123", role="admin")
+        db.add(default_admin)
+        db.commit()
+    db.close()
+
+# --- SECURITY & ROLES ---
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-VALID_USERNAME = "admin"
-VALID_PASSWORD = "admin123"
-SECRET_TOKEN = "lnhc-secure-token-2026"
-
 @app.post("/login")
-def login(req: LoginRequest):
-    if req.username == VALID_USERNAME and req.password == VALID_PASSWORD:
-        return {"access_token": SECRET_TOKEN}
-    raise HTTPException(status_code=401, detail="Invalid username or password")
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(database.AppUser).filter(database.AppUser.username == req.username, database.AppUser.password == req.password).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    # Issue a secure login token for this session
+    token = secrets.token_hex(16)
+    user.token = token
+    db.commit()
+    return {"access_token": token, "role": user.role, "username": user.username}
 
-def verify_token(authorization: Optional[str] = Header(None)):
-    if not authorization or authorization != f"Bearer {SECRET_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized access. Please log in.")
-    return True
+def get_current_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Please log in.")
+    token = authorization.split(" ")[1]
+    user = db.query(database.AppUser).filter(database.AppUser.token == token).first()
+    if not user: raise HTTPException(status_code=401, detail="Session expired.")
+    return user
+
+def require_admin(current_user: database.AppUser = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only Admins can perform this action.")
+    return current_user
+
+# --- USER MANAGEMENT (Admin Only) ---
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str
+
+@app.post("/users/")
+def create_user(user: UserCreate, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
+    existing = db.query(database.AppUser).filter(database.AppUser.username == user.username).first()
+    if existing: raise HTTPException(status_code=400, detail="Username already exists")
+    new_user = database.AppUser(username=user.username, password=user.password, role=user.role)
+    db.add(new_user)
+    db.commit()
+    return {"message": "User created"}
+
+@app.get("/users/")
+def get_users(db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
+    users = db.query(database.AppUser).all()
+    return [{"id": u.id, "username": u.username, "role": u.role} for u in users]
+
+@app.delete("/users/{user_id}")
+def delete_user(user_id: int, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
+    user = db.query(database.AppUser).filter(database.AppUser.id == user_id).first()
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    if user.username == "admin": raise HTTPException(status_code=400, detail="Cannot delete Master Admin")
+    db.delete(user)
+    db.commit()
+    return {"message": "User deleted"}
 
 # --- PYDANTIC SCHEMAS ---
 class ItemInput(BaseModel):
     description: str; quantity: int; purity: str; weight: float
 
-class CustomerUpdate(BaseModel):
-    business_name: str
-    phone: str
-    address: str
-    license_number: str
-    gstin: Optional[str] = None
-
 class JobCardInput(BaseModel):
-    customer_id: int; request_number: str; items: List[ItemInput]
-    custom_date: Optional[str] = None
+    customer_id: int; request_number: str; items: List[ItemInput]; custom_date: Optional[str] = None
 
 class ItemGrading(BaseModel):
     item_id: int; hm: int; rej: int; melt: int; rtn: int
 
 class BillPayload(BaseModel):
-    customer_id: int; request_number: str; results: List[ItemGrading]
-    custom_date: Optional[str] = None
+    customer_id: int; request_number: str; results: List[ItemGrading]; custom_date: Optional[str] = None
 
 class ItemUpdate(BaseModel):
     description: str; quantity: int; purity: str; weight: float
@@ -74,56 +115,47 @@ class NewItemCreate(BaseModel):
 
 # --- CUSTOMER ENDPOINTS ---
 @app.post("/customers/")
-def create_customer(business_name: str, phone: str, address: str, license_number: str, gstin: Optional[str] = None, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def create_customer(business_name: str, phone: str, address: str, license_number: str, gstin: Optional[str] = None, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     new_customer = database.Customer(business_name=business_name, phone=phone, address=address, license_number=license_number, gstin=gstin)
     db.add(new_customer)
-    db.commit()
-    db.refresh(new_customer)
+    db.commit(); db.refresh(new_customer)
     return new_customer
 
 @app.get("/customers/")
-def get_all_customers(db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def get_all_customers(db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     return db.query(database.Customer).order_by(database.Customer.business_name.asc()).all()
 
 @app.put("/customers/{customer_id}")
-def update_customer(customer_id: int, data: CustomerUpdate, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def update_customer(customer_id: int, data: dict, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
-    if not customer:
-        raise HTTPException(status_code=404, detail="Jeweler not found")
-    
-    # Update all the fields
-    customer.business_name = data.business_name
-    customer.phone = data.phone
-    customer.address = data.address
-    customer.license_number = data.license_number
-    customer.gstin = data.gstin
-    
+    if not customer: raise HTTPException(status_code=404, detail="Jeweler not found")
+    customer.business_name = data.get("business_name")
+    customer.phone = data.get("phone")
+    customer.address = data.get("address")
+    customer.license_number = data.get("license_number")
+    customer.gstin = data.get("gstin")
     db.commit()
     return {"message": "Jeweler updated successfully"}
 
+# Notice: require_admin replaces get_current_user here!
 @app.delete("/customers/{customer_id}")
-def delete_customer(customer_id: int, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def delete_customer(customer_id: int, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
     customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
-    if not customer:
-        raise HTTPException(status_code=404, detail="Jeweler not found.")
-
+    if not customer: raise HTTPException(status_code=404, detail="Jeweler not found.")
     existing_jobs = db.query(database.JobCard).filter(database.JobCard.customer_id == customer_id).first()
-    if existing_jobs:
-        raise HTTPException(status_code=400, detail="Cannot delete this Jeweler because they have existing Job Cards or Bills in the system.")
-
+    if existing_jobs: raise HTTPException(status_code=400, detail="Cannot delete this Jeweler because they have existing Job Cards or Bills in the system.")
     db.delete(customer)
     db.commit()
     return {"message": "Jeweler deleted successfully"}
 
 # --- JOB CARD ENDPOINTS ---
 @app.post("/jobcards/")
-def create_job_card(data: JobCardInput, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def create_job_card(data: JobCardInput, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     final_date = datetime.utcnow()
     if data.custom_date:
         try: final_date = datetime.strptime(data.custom_date, "%Y-%m-%dT%H:%M")
         except ValueError: pass
 
-    # 1. Calculate Daily Receipt Number (e.g. C-01042026-1)
     start_of_day = final_date.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = final_date.replace(hour=23, minute=59, second=59, microsecond=999999)
     daily_count = db.query(database.JobCard).filter(database.JobCard.date_received >= start_of_day, database.JobCard.date_received <= end_of_day).count()
@@ -132,23 +164,21 @@ def create_job_card(data: JobCardInput, db: Session = Depends(get_db), secure: b
 
     new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number, date_received=final_date, receipt_no=receipt_no_str)
     db.add(new_job)
-    db.commit()
-    db.refresh(new_job)
+    db.commit(); db.refresh(new_job)
     
     for item in data.items:
         new_item = database.JobItem(job_card_id=new_job.id, item_description=item.description, quantity=item.quantity, declared_purity=item.purity, weight_grams=item.weight)
         db.add(new_item)
     db.commit()
-    
     return {"job_card_id": new_job.id, "receipt_no": new_job.receipt_no, "request_number": new_job.request_number, "message": "Saved."}
 
 @app.get("/pending_requests/{customer_id}")
-def get_pending_requests(customer_id: int, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def get_pending_requests(customer_id: int, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     jobs = db.query(database.JobCard.request_number).filter(database.JobCard.customer_id == customer_id, database.JobCard.status == "Pending").distinct().all()
     return [j[0] for j in jobs if j[0]]
 
 @app.get("/pending_items/{request_no}")
-def get_pending_items(request_no: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def get_pending_items(request_no: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     pending_jobs = db.query(database.JobCard).filter(database.JobCard.request_number == request_no, database.JobCard.status == "Pending").all()
     items = []
     for job in pending_jobs:
@@ -158,7 +188,7 @@ def get_pending_items(request_no: str, db: Session = Depends(get_db), secure: bo
     return items
 
 @app.put("/update_item/{item_id}")
-def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     db_item = db.query(database.JobItem).filter(database.JobItem.id == item_id).first()
     if not db_item: raise HTTPException(status_code=404, detail="Item not found")
     db_item.item_description = item.description; db_item.quantity = item.quantity; db_item.declared_purity = item.purity; db_item.weight_grams = item.weight
@@ -166,17 +196,17 @@ def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db), s
     return {"message": "Item updated successfully"}
 
 @app.post("/add_item_to_request/{request_number}")
-def add_item_to_request(request_number: str, item: NewItemCreate, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def add_item_to_request(request_number: str, item: NewItemCreate, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     job = db.query(database.JobCard).filter(database.JobCard.request_number == request_number).first()
     if not job: raise HTTPException(status_code=404, detail="Job not found")
-    
     new_item = database.JobItem(job_card_id=job.id, item_description=item.description, quantity=item.quantity, weight_grams=item.weight, declared_purity=item.purity)
     db.add(new_item)
     db.commit()
     return {"message": "Item added successfully"}
 
+# Notice: require_admin replaces get_current_user here!
 @app.delete("/delete_request/{request_no}")
-def delete_request(request_no: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def delete_request(request_no: str, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
     pending_jobs = db.query(database.JobCard).filter(database.JobCard.request_number == request_no, database.JobCard.status == "Pending").all()
     if not pending_jobs: raise HTTPException(status_code=404, detail="Pending request not found")
     
@@ -184,14 +214,13 @@ def delete_request(request_no: str, db: Session = Depends(get_db), secure: bool 
         db.query(database.JobItem).filter(database.JobItem.job_card_id == job.id).delete()
         db.delete(job)
     db.commit()
-    
     db.execute(text("SELECT setval(pg_get_serial_sequence('job_cards', 'id'), coalesce(max(id), 1), max(id) IS NOT null) FROM job_cards;"))
     db.commit()
     return {"message": "Request deleted and sequence reset"}
 
 # --- INVOICE ENDPOINTS ---
 @app.post("/generate_invoice/")
-def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     pending_jobs = db.query(database.JobCard).filter(database.JobCard.customer_id == payload.customer_id, database.JobCard.request_number == payload.request_number, database.JobCard.status == "Pending").all()
     if not pending_jobs: raise HTTPException(status_code=404, detail="No pending jobs for this Request Number.")
 
@@ -200,7 +229,6 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), secure
         try: final_date = datetime.strptime(payload.custom_date, "%Y-%m-%dT%H:%M")
         except ValueError: pass
     
-    # 1. Calculate Daily Bill Number (e.g. INV-01042026-1)
     start_of_day = final_date.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = final_date.replace(hour=23, minute=59, second=59, microsecond=999999)
     daily_count = db.query(database.Invoice).filter(database.Invoice.created_at >= start_of_day, database.Invoice.created_at <= end_of_day).count()
@@ -227,25 +255,20 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), secure
     return {"invoice_number": new_invoice.id, "bill_no": new_invoice.bill_no, "total_bill": final_amount}
 
 @app.get("/find_invoice_by_request/{request_no}")
-def find_invoice_by_request(request_no: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def find_invoice_by_request(request_no: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     job = db.query(database.JobCard).filter(database.JobCard.request_number == request_no).first()
     if not job or not job.invoice_id: raise HTTPException(status_code=404, detail="No billed invoice found for this Request No.")
-    
     invoice = db.query(database.Invoice).filter(database.Invoice.id == job.invoice_id).first()
     bill_display = invoice.bill_no if invoice.bill_no else str(invoice.id)
     return {"invoice_id": bill_display}
 
 @app.get("/print_invoice/{invoice_identifier}")
-def print_invoice(invoice_identifier: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
-    # Safely handles both new string IDs (INV-...) and old integer IDs (1, 2, 3...)
+def print_invoice(invoice_identifier: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     invoice = db.query(database.Invoice).filter(database.Invoice.bill_no == invoice_identifier).first()
     if not invoice and invoice_identifier.isdigit():
         invoice = db.query(database.Invoice).filter(database.Invoice.id == int(invoice_identifier)).first()
-        
     if not invoice: raise HTTPException(status_code=404, detail="Invoice not found")
-    
     customer = db.query(database.Customer).filter(database.Customer.id == invoice.customer_id).first()
-
     item_list = []; request_numbers = []
     billed_jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == invoice.id).order_by(database.JobCard.date_received.asc()).all()
     
@@ -264,7 +287,6 @@ def print_invoice(invoice_identifier: str, db: Session = Depends(get_db), secure
         for i in items: item_list.append({"description": i.item_description, "purity": i.declared_purity, "quantity": i.quantity, "hm": i.hm, "rej": i.rej, "melt": i.melt, "rtn": i.rtn})
 
     bill_no_display = invoice.bill_no if invoice.bill_no else f"#00{invoice.id}"
-
     return {
         "invoice_no": bill_no_display, "job_date_time": job_time_ist, "bill_date_time": bill_time_ist,
         "customer_name": customer.business_name or "Unknown", "customer_address": customer.address or "", 
@@ -274,7 +296,7 @@ def print_invoice(invoice_identifier: str, db: Session = Depends(get_db), secure
 
 # --- REPORTS ---
 @app.get("/report/{customer_id}")
-def generate_report(customer_id: int, start_date: str, end_date: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def generate_report(customer_id: int, start_date: str, end_date: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     start = datetime.strptime(start_date, "%Y-%m-%d"); end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
     invoices = db.query(database.Invoice).filter(database.Invoice.customer_id == customer_id, database.Invoice.created_at >= start, database.Invoice.created_at <= end).order_by(database.Invoice.created_at.asc()).all()
     customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
@@ -287,21 +309,18 @@ def generate_report(customer_id: int, start_date: str, end_date: str, db: Sessio
         pcs = 0; item_descriptions = []
         for j in jobs:
             items = db.query(database.JobItem).filter(database.JobItem.job_card_id == j.id).all()
-            for i in items:
-                pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
+            for i in items: pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
         item_details_str = ", ".join(item_descriptions)
-        
         bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
         report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
         grand_total += inv.total_amount; total_pieces += pcs
-        
     return { "customer_name": cust_name, "report_data": report_data, "grand_total": round(grand_total, 2), "total_items": total_pieces }
 
+# Notice: require_admin replaces get_current_user here! Master reports are for management.
 @app.get("/report_all/")
-def generate_master_report(start_date: str, end_date: str, db: Session = Depends(get_db), secure: bool = Depends(verify_token)):
+def generate_master_report(start_date: str, end_date: str, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
     start = datetime.strptime(start_date, "%Y-%m-%d"); end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
     invoices = db.query(database.Invoice).filter(database.Invoice.created_at >= start, database.Invoice.created_at <= end).order_by(database.Invoice.created_at.asc()).all()
-    
     report_data = []; grand_total = 0; total_pieces = 0
     for inv in invoices:
         customer = db.query(database.Customer).filter(database.Customer.id == inv.customer_id).first()
@@ -311,12 +330,9 @@ def generate_master_report(start_date: str, end_date: str, db: Session = Depends
         pcs = 0; item_descriptions = []
         for j in jobs:
             items = db.query(database.JobItem).filter(database.JobItem.job_card_id == j.id).all()
-            for i in items:
-                pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
+            for i in items: pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
         item_details_str = ", ".join(item_descriptions)
-        
         bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
         report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
         grand_total += inv.total_amount; total_pieces += pcs
-        
     return { "customer_name": "ALL JEWELERS (MASTER REPORT)", "report_data": report_data, "grand_total": round(grand_total, 2), "total_items": total_pieces }
