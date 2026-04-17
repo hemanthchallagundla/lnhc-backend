@@ -2,6 +2,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
+# Your live Neon PostgreSQL database connection!
 SQLALCHEMY_DATABASE_URL = "postgresql://neondb_owner:npg_5qWFMUNe2QoE@ep-rough-smoke-a1bn3tx2-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 
 engine = create_engine(
@@ -14,7 +15,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- THE MISSING APP_USERS TABLE ---
+# --- NEW: USERS TABLE ---
 class AppUser(Base):
     __tablename__ = "app_users"
     id = Column(Integer, primary_key=True, index=True)
@@ -65,4 +66,5 @@ class JobItem(Base):
     melt = Column(Integer, default=0)
     rtn = Column(Integer, default=0)
 
+# This command will instantly create all these tables inside your new Neon database!
 Base.metadata.create_all(bind=engine)
