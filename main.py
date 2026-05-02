@@ -116,9 +116,13 @@ class NewItemCreate(BaseModel):
 # --- CUSTOMER ENDPOINTS ---
 @app.post("/customers/")
 def create_customer(business_name: str, phone: str, address: str, license_number: str, gstin: Optional[str] = None, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
-    new_customer = database.Customer(business_name=business_name, phone=phone, address=address, license_number=license_number, gstin=gstin)
+    # THE FIX: If gstin is an empty string, turn it into Python's 'None' (which becomes SQL NULL)
+    final_gstin = gstin if gstin and gstin.strip() != "" else None
+    
+    new_customer = database.Customer(business_name=business_name, phone=phone, address=address, license_number=license_number, gstin=final_gstin)
     db.add(new_customer)
-    db.commit(); db.refresh(new_customer)
+    db.commit() 
+    db.refresh(new_customer)
     return new_customer
 
 @app.get("/customers/")
@@ -129,11 +133,16 @@ def get_all_customers(db: Session = Depends(get_db), user: database.AppUser = De
 def update_customer(customer_id: int, data: dict, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
     if not customer: raise HTTPException(status_code=404, detail="Jeweler not found")
+    
     customer.business_name = data.get("business_name")
     customer.phone = data.get("phone")
     customer.address = data.get("address")
     customer.license_number = data.get("license_number")
-    customer.gstin = data.get("gstin")
+    
+    # THE FIX: If gstin is an empty string, turn it into Python's 'None'
+    incoming_gstin = data.get("gstin")
+    customer.gstin = incoming_gstin if incoming_gstin and incoming_gstin.strip() != "" else None
+    
     db.commit()
     return {"message": "Jeweler updated successfully"}
 
