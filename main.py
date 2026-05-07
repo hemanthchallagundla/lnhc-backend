@@ -158,8 +158,20 @@ def delete_customer(customer_id: int, db: Session = Depends(get_db), admin: data
     return {"message": "Jeweler deleted successfully"}
 
 # --- JOB CARD ENDPOINTS ---
+
+@app.get("/check_request_no/{request_no}")
+def check_request_no(request_no: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
+    # Instantly checks if this Request No has ever been used
+    exists = db.query(database.JobCard).filter(database.JobCard.request_number == request_no).first()
+    return {"exists": bool(exists)}
+
 @app.post("/jobcards/")
 def create_job_card(data: JobCardInput, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
+    # THE WALL: Block duplicate Request Numbers from being saved
+    existing_req = db.query(database.JobCard).filter(database.JobCard.request_number == data.request_number).first()
+    if existing_req:
+        raise HTTPException(status_code=400, detail=f"Request Number '{data.request_number}' has already been used! Please type the correct one.")
+
     final_date = datetime.utcnow()
     if data.custom_date:
         try: final_date = datetime.strptime(data.custom_date, "%Y-%m-%dT%H:%M")
@@ -180,7 +192,6 @@ def create_job_card(data: JobCardInput, db: Session = Depends(get_db), user: dat
         db.add(new_item)
     db.commit()
     return {"job_card_id": new_job.id, "receipt_no": new_job.receipt_no, "request_number": new_job.request_number, "message": "Saved."}
-
 @app.get("/pending_requests/{customer_id}")
 def get_pending_requests(customer_id: int, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     jobs = db.query(database.JobCard.request_number).filter(database.JobCard.customer_id == customer_id, database.JobCard.status == "Pending").distinct().all()
