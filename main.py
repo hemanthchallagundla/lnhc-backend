@@ -227,6 +227,48 @@ def delete_request(request_no: str, db: Session = Depends(get_db), admin: databa
     db.commit()
     return {"message": "Request deleted and sequence reset"}
 
+@app.get("/print_receipt_data/{identifier}")
+def get_receipt_data(identifier: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
+    # Find the job by either the Request Number or the Receipt Number
+    job = db.query(database.JobCard).filter(
+        (database.JobCard.request_number == identifier) | 
+        (database.JobCard.receipt_no == identifier)
+    ).first()
+    
+    if not job: raise HTTPException(status_code=404, detail="Receipt not found")
+    
+    customer = db.query(database.Customer).filter(database.Customer.id == job.customer_id).first()
+    
+    # Grab all items submitted under this receipt
+    if job.receipt_no:
+        jobs = db.query(database.JobCard).filter(database.JobCard.receipt_no == job.receipt_no).all()
+    else:
+        jobs = db.query(database.JobCard).filter(database.JobCard.request_number == job.request_number).all()
+        
+    items = []
+    for j in jobs:
+        j_items = db.query(database.JobItem).filter(database.JobItem.job_card_id == j.id).order_by(database.JobItem.id.asc()).all()
+        for i in j_items:
+            items.append({
+                "description": i.item_description,
+                "quantity": i.quantity,
+                "purity": i.declared_purity,
+                "weight": i.weight_grams
+            })
+    
+    def to_ist(utc_dt):
+        if not utc_dt: return datetime.now()
+        return utc_dt + timedelta(hours=5, minutes=30)
+        
+    return {
+        "receipt_no": job.receipt_no or f"HMD{job.id}",
+        "request_no": job.request_number,
+        "customer_name": customer.business_name if customer else "Unknown",
+        "customer_address": customer.address if customer else "",
+        "time_string": to_ist(job.date_received).strftime("%d-%m-%Y %I:%M %p"),
+        "items": items
+    }
+
 # --- INVOICE ENDPOINTS ---
 @app.post("/generate_invoice/")
 def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
