@@ -448,7 +448,6 @@ from datetime import timedelta
 
 @app.get("/royalty_report/")
 def generate_royalty_report(month: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
-    # The 'month' comes in as "YYYY-MM" (e.g., "2026-05")
     try:
         start_date = datetime.strptime(f"{month}-01", "%Y-%m-%d")
         if start_date.month == 12:
@@ -459,60 +458,97 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid month format.")
 
-    # Get all invoices for that specific month
     invoices = db.query(database.Invoice).filter(
         database.Invoice.created_at >= start_date,
         database.Invoice.created_at <= end_date
-    ).order_by(database.Invoice.created_at.asc()).all()
+    ).all()
 
-    report_data = []
-    total_monthly_royalty = 0.0
+    customer_aggregates = {}
 
     for inv in invoices:
-        customer = db.query(database.Customer).filter(database.Customer.id == inv.customer_id).first()
-        cust_name = customer.business_name if customer else "Unknown"
-
-        # Count the pieces for the specific invoice
+        if inv.customer_id not in customer_aggregates:
+            customer = db.query(database.Customer).filter(database.Customer.id == inv.customer_id).first()
+            customer_aggregates[inv.customer_id] = {
+                "party_name": customer.business_name if customer else "Unknown",
+                "hm_pcs": 0,
+                "weight": 0.0,
+                "amt": 0.0,
+                "min_bills": 0,
+                "remaining_pcs": 0
+            }
+            
+        agg = customer_aggregates[inv.customer_id]
+        
         jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == inv.id).all()
-        total_pcs = 0
-        hm_pcs = 0
-        req_nos = []
+        inv_total_pcs = 0
+        inv_hm_pcs = 0
+        inv_weight = 0.0
+        
         for j in jobs:
-            if j.request_number: req_nos.append(j.request_number)
             items = db.query(database.JobItem).filter(database.JobItem.job_card_id == j.id).all()
             for item in items:
-                total_pcs += item.quantity
-                hm_pcs += item.hm
-
-        # --- YOUR EXACT ROYALTY MATH ---
-        if 1 <= total_pcs <= 4:
-            inv_royalty = 20.00
-        elif total_pcs > 4:
-            inv_royalty = hm_pcs * 4.50
+                inv_total_pcs += item.quantity
+                inv_hm_pcs += item.hm
+                inv_weight += item.weight_grams
+                
+        # Assaying Amount before GST
+        inv_amt = max(inv_total_pcs * 45.0, 200.0)
+        
+        agg["hm_pcs"] += inv_hm_pcs
+        agg["weight"] += inv_weight
+        agg["amt"] += inv_amt
+        
+        # Split logic exactly like your CSV
+        if inv_total_pcs <= 4:
+            agg["min_bills"] += 1
         else:
-            inv_royalty = 0.00
+            agg["remaining_pcs"] += inv_hm_pcs
 
-        total_monthly_royalty += inv_royalty
+    report_data = []
+    overall_total_royalty = 0.0
 
+    # Sort alphabetically by party name
+    sorted_customers = sorted(customer_aggregates.values(), key=lambda x: x["party_name"])
+
+    for idx, agg in enumerate(sorted_customers, start=1):
+        amt = agg["amt"]
+        cgst = round(amt * 0.09, 2)
+        sgst = round(amt * 0.09, 2)
+        total = round(amt + cgst + sgst, 2)
+        
+        min_bills = agg["min_bills"]
+        remaining_pcs = agg["remaining_pcs"]
+        
+        royalty_min_bills = min_bills * 20.0
+        remaining_royalty = remaining_pcs * 4.50
+        total_royalty = royalty_min_bills + remaining_royalty
+        
+        overall_total_royalty += total_royalty
+        
         report_data.append({
-            "date": inv.created_at.strftime("%d-%m-%Y"),
-            "invoice_no": inv.bill_no or f"#00{inv.id}",
-            "customer_name": cust_name,
-            "request_nos": ", ".join(req_nos),
-            "total_pieces": total_pcs,
-            "hm_pieces": hm_pcs,
-            "royalty_amount": round(inv_royalty, 2)
+            "sno": idx,
+            "party_name": agg["party_name"],
+            "pcs": agg["hm_pcs"],
+            "wt": round(agg["weight"], 3),
+            "amt": round(amt, 2),
+            "cgst": cgst,
+            "sgst": sgst,
+            "total": total,
+            "min_bills": min_bills,
+            "remaining_pcs": remaining_pcs,
+            "royalty_min_bills": round(royalty_min_bills, 2),
+            "remaining_royalty": round(remaining_royalty, 2),
+            "total_royalty": round(total_royalty, 2)
         })
 
-    # Final GST and Grand Total calculations
-    total_monthly_royalty = round(total_monthly_royalty, 2)
-    monthly_gst = round(total_monthly_royalty * 0.18, 2)
-    grand_total = round(total_monthly_royalty + monthly_gst, 2)
+    overall_total_royalty = round(overall_total_royalty, 2)
+    overall_gst = round(overall_total_royalty * 0.18, 2)
+    grand_total_royalty_gst = round(overall_total_royalty + overall_gst, 2)
 
     return {
         "month_display": start_date.strftime("%B %Y"),
         "report_data": report_data,
-        "total_royalty": total_monthly_royalty,
-        "gst_amount": monthly_gst,
-        "grand_total": grand_total
+        "overall_total_royalty": overall_total_royalty,
+        "overall_gst": overall_gst,
+        "grand_total_royalty_gst": grand_total_royalty_gst
     }
