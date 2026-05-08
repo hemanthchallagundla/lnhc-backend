@@ -116,9 +116,7 @@ class NewItemCreate(BaseModel):
 # --- CUSTOMER ENDPOINTS ---
 @app.post("/customers/")
 def create_customer(business_name: str, phone: str, address: str, license_number: str, gstin: Optional[str] = None, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
-    # THE FIX: If gstin is an empty string, turn it into Python's 'None' (which becomes SQL NULL)
     final_gstin = gstin if gstin and gstin.strip() != "" else None
-    
     new_customer = database.Customer(business_name=business_name, phone=phone, address=address, license_number=license_number, gstin=final_gstin)
     db.add(new_customer)
     db.commit() 
@@ -139,14 +137,12 @@ def update_customer(customer_id: int, data: dict, db: Session = Depends(get_db),
     customer.address = data.get("address")
     customer.license_number = data.get("license_number")
     
-    # THE FIX: If gstin is an empty string, turn it into Python's 'None'
     incoming_gstin = data.get("gstin")
     customer.gstin = incoming_gstin if incoming_gstin and incoming_gstin.strip() != "" else None
     
     db.commit()
     return {"message": "Jeweler updated successfully"}
 
-# Notice: require_admin replaces get_current_user here!
 @app.delete("/customers/{customer_id}")
 def delete_customer(customer_id: int, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
     customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
@@ -158,32 +154,35 @@ def delete_customer(customer_id: int, db: Session = Depends(get_db), admin: data
     return {"message": "Jeweler deleted successfully"}
 
 # --- JOB CARD ENDPOINTS ---
-
 @app.get("/check_request_no/{request_no}")
 def check_request_no(request_no: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
-    # Instantly checks if this Request No has ever been used
     exists = db.query(database.JobCard).filter(database.JobCard.request_number == request_no).first()
     return {"exists": bool(exists)}
 
 @app.post("/jobcards/")
 def create_job_card(data: JobCardInput, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
-    # THE WALL: Block duplicate Request Numbers from being saved
     existing_req = db.query(database.JobCard).filter(database.JobCard.request_number == data.request_number).first()
     if existing_req:
         raise HTTPException(status_code=400, detail=f"Request Number '{data.request_number}' has already been used! Please type the correct one.")
 
-    final_date = datetime.utcnow()
+    # Convert IST to UTC for database storage, ensuring reports find it correctly
+    final_date_utc = datetime.utcnow()
+    display_date_ist = final_date_utc + timedelta(hours=5, minutes=30)
+    
     if data.custom_date:
-        try: final_date = datetime.strptime(data.custom_date, "%Y-%m-%dT%H:%M")
+        try:
+            display_date_ist = datetime.strptime(data.custom_date, "%Y-%m-%dT%H:%M")
+            final_date_utc = display_date_ist - timedelta(hours=5, minutes=30)
         except ValueError: pass
 
-    start_of_day = final_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_of_day = final_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+    start_of_day = final_date_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = final_date_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
     daily_count = db.query(database.JobCard).filter(database.JobCard.date_received >= start_of_day, database.JobCard.date_received <= end_of_day).count()
     seq = daily_count + 1
-    receipt_no_str = f"C-{final_date.strftime('%d%m%Y')}-{seq}"
+    
+    receipt_no_str = f"C-{display_date_ist.strftime('%d%m%Y')}-{seq}"
 
-    new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number, date_received=final_date, receipt_no=receipt_no_str)
+    new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number, date_received=final_date_utc, receipt_no=receipt_no_str)
     db.add(new_job)
     db.commit(); db.refresh(new_job)
     
@@ -192,6 +191,7 @@ def create_job_card(data: JobCardInput, db: Session = Depends(get_db), user: dat
         db.add(new_item)
     db.commit()
     return {"job_card_id": new_job.id, "receipt_no": new_job.receipt_no, "request_number": new_job.request_number, "message": "Saved."}
+
 @app.get("/pending_requests/{customer_id}")
 def get_pending_requests(customer_id: int, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     jobs = db.query(database.JobCard.request_number).filter(database.JobCard.customer_id == customer_id, database.JobCard.status == "Pending").distinct().all()
@@ -224,7 +224,6 @@ def add_item_to_request(request_number: str, item: NewItemCreate, db: Session = 
     db.commit()
     return {"message": "Item added successfully"}
 
-# Notice: require_admin replaces get_current_user here!
 @app.delete("/delete_request/{request_no}")
 def delete_request(request_no: str, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
     pending_jobs = db.query(database.JobCard).filter(database.JobCard.request_number == request_no, database.JobCard.status == "Pending").all()
@@ -240,7 +239,6 @@ def delete_request(request_no: str, db: Session = Depends(get_db), admin: databa
 
 @app.get("/print_receipt_data/{identifier}")
 def get_receipt_data(identifier: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
-    # Find the job by either the Request Number or the Receipt Number
     job = db.query(database.JobCard).filter(
         (database.JobCard.request_number == identifier) | 
         (database.JobCard.receipt_no == identifier)
@@ -250,7 +248,6 @@ def get_receipt_data(identifier: str, db: Session = Depends(get_db), user: datab
     
     customer = db.query(database.Customer).filter(database.Customer.id == job.customer_id).first()
     
-    # Grab all items submitted under this receipt
     if job.receipt_no:
         jobs = db.query(database.JobCard).filter(database.JobCard.receipt_no == job.receipt_no).all()
     else:
@@ -286,16 +283,21 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), user: 
     pending_jobs = db.query(database.JobCard).filter(database.JobCard.customer_id == payload.customer_id, database.JobCard.request_number == payload.request_number, database.JobCard.status == "Pending").all()
     if not pending_jobs: raise HTTPException(status_code=404, detail="No pending jobs for this Request Number.")
 
-    final_date = datetime.utcnow()
+    # Fix: Convert IST custom date back to UTC for database storage
+    final_date_utc = datetime.utcnow()
+    display_date_ist = final_date_utc + timedelta(hours=5, minutes=30)
+    
     if payload.custom_date:
-        try: final_date = datetime.strptime(payload.custom_date, "%Y-%m-%dT%H:%M")
+        try: 
+            display_date_ist = datetime.strptime(payload.custom_date, "%Y-%m-%dT%H:%M")
+            final_date_utc = display_date_ist - timedelta(hours=5, minutes=30)
         except ValueError: pass
     
-    start_of_day = final_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_of_day = final_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+    start_of_day = final_date_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = final_date_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
     daily_count = db.query(database.Invoice).filter(database.Invoice.created_at >= start_of_day, database.Invoice.created_at <= end_of_day).count()
     seq = daily_count + 1
-    bill_no_str = f"INV-{final_date.strftime('%d%m%Y')}-{seq}"
+    bill_no_str = f"INV-{display_date_ist.strftime('%d%m%Y')}-{seq}"
 
     total_pieces = 0
     for res in payload.results:
@@ -307,7 +309,7 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), user: 
     calculated_amount = total_pieces * 45.0
     final_amount = max(calculated_amount, 200.0)
     
-    new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount, created_at=final_date, bill_no=bill_no_str)
+    new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount, created_at=final_date_utc, bill_no=bill_no_str)
     db.add(new_invoice)
     db.commit(); db.refresh(new_invoice)
     
@@ -369,12 +371,16 @@ def track_job(identifier: str, db: Session = Depends(get_db)):
     customer = db.query(database.Customer).filter(database.Customer.id == job.customer_id).first()
     items = db.query(database.JobItem).filter(database.JobItem.job_card_id == job.id).all()
     
+    def to_ist(utc_dt):
+        if not utc_dt: return datetime.now()
+        return utc_dt + timedelta(hours=5, minutes=30)
+        
     return {
         "request_no": job.request_number,
         "receipt_no": job.receipt_no,
-        "status": job.status, # Returns "Pending" or "Billed"
+        "status": job.status,
         "customer": customer.business_name if customer else "Unknown",
-        "date": job.date_received.strftime("%d-%m-%Y"),
+        "date": to_ist(job.date_received).strftime("%d-%m-%Y"),
         "total_items": sum(i.quantity for i in items)
     }
 
@@ -383,7 +389,8 @@ import math
 
 @app.get("/report/{customer_id}")
 def generate_report(customer_id: int, start_date: str, end_date: str, page: int = 1, limit: int = 50, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
-    start = datetime.strptime(start_date, "%Y-%m-%d"); end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
+    start = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(hours=5, minutes=30)
+    end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S") - timedelta(hours=5, minutes=30)
     
     base_query = db.query(database.Invoice).filter(database.Invoice.customer_id == customer_id, database.Invoice.created_at >= start, database.Invoice.created_at <= end)
     
@@ -395,10 +402,13 @@ def generate_report(customer_id: int, start_date: str, end_date: str, page: int 
     cust_name = customer.business_name if customer else "Unknown"
     
     report_data = []; grand_total = 0; total_pieces = 0
-    # Also calculate the true grand total across ALL pages for the top summary
     all_invoices = base_query.all()
     for inv in all_invoices: grand_total += inv.total_amount
     
+    def to_ist(utc_dt):
+        if not utc_dt: return datetime.now()
+        return utc_dt + timedelta(hours=5, minutes=30)
+        
     for inv in invoices:
         jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == inv.id).all()
         req_nos = ", ".join([j.request_number for j in jobs if j.request_number])
@@ -408,14 +418,15 @@ def generate_report(customer_id: int, start_date: str, end_date: str, page: int 
             for i in items: pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
         item_details_str = ", ".join(item_descriptions)
         bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
-        report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
+        report_data.append({"date": to_ist(inv.created_at).strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
         total_pieces += pcs
         
     return { "customer_name": cust_name, "report_data": report_data, "grand_total": round(grand_total, 2), "page_items": total_pieces, "current_page": page, "total_pages": total_pages }
 
 @app.get("/report_all/")
 def generate_master_report(start_date: str, end_date: str, page: int = 1, limit: int = 50, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
-    start = datetime.strptime(start_date, "%Y-%m-%d"); end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
+    start = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(hours=5, minutes=30)
+    end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S") - timedelta(hours=5, minutes=30)
     
     base_query = db.query(database.Invoice).filter(database.Invoice.created_at >= start, database.Invoice.created_at <= end)
     
@@ -428,6 +439,10 @@ def generate_master_report(start_date: str, end_date: str, page: int = 1, limit:
     all_invoices = base_query.all()
     for inv in all_invoices: grand_total += inv.total_amount
     
+    def to_ist(utc_dt):
+        if not utc_dt: return datetime.now()
+        return utc_dt + timedelta(hours=5, minutes=30)
+        
     for inv in invoices:
         customer = db.query(database.Customer).filter(database.Customer.id == inv.customer_id).first()
         cust_name = customer.business_name if customer else "Unknown"
@@ -439,12 +454,10 @@ def generate_master_report(start_date: str, end_date: str, page: int = 1, limit:
             for i in items: pcs += i.quantity; item_descriptions.append(f"{i.quantity}x {i.item_description}")
         item_details_str = ", ".join(item_descriptions)
         bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
-        report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
+        report_data.append({"date": to_ist(inv.created_at).strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
         total_pieces += pcs
         
     return { "customer_name": "ALL JEWELERS (MASTER REPORT)", "report_data": report_data, "grand_total": round(grand_total, 2), "page_items": total_pieces, "current_page": page, "total_pages": total_pages }
-
-from datetime import timedelta
 
 @app.get("/royalty_report/")
 def generate_royalty_report(month: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
