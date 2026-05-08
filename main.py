@@ -443,3 +443,76 @@ def generate_master_report(start_date: str, end_date: str, page: int = 1, limit:
         total_pieces += pcs
         
     return { "customer_name": "ALL JEWELERS (MASTER REPORT)", "report_data": report_data, "grand_total": round(grand_total, 2), "page_items": total_pieces, "current_page": page, "total_pages": total_pages }
+
+from datetime import timedelta
+
+@app.get("/royalty_report/")
+def generate_royalty_report(month: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
+    # The 'month' comes in as "YYYY-MM" (e.g., "2026-05")
+    try:
+        start_date = datetime.strptime(f"{month}-01", "%Y-%m-%d")
+        if start_date.month == 12:
+            end_date = start_date.replace(year=start_date.year+1, month=1, day=1) - timedelta(days=1)
+        else:
+            end_date = start_date.replace(month=start_date.month+1, day=1) - timedelta(days=1)
+        end_date = end_date.replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid month format.")
+
+    # Get all invoices for that specific month
+    invoices = db.query(database.Invoice).filter(
+        database.Invoice.created_at >= start_date,
+        database.Invoice.created_at <= end_date
+    ).order_by(database.Invoice.created_at.asc()).all()
+
+    report_data = []
+    total_monthly_royalty = 0.0
+
+    for inv in invoices:
+        customer = db.query(database.Customer).filter(database.Customer.id == inv.customer_id).first()
+        cust_name = customer.business_name if customer else "Unknown"
+
+        # Count the pieces for the specific invoice
+        jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == inv.id).all()
+        total_pcs = 0
+        hm_pcs = 0
+        req_nos = []
+        for j in jobs:
+            if j.request_number: req_nos.append(j.request_number)
+            items = db.query(database.JobItem).filter(database.JobItem.job_card_id == j.id).all()
+            for item in items:
+                total_pcs += item.quantity
+                hm_pcs += item.hm
+
+        # --- YOUR EXACT ROYALTY MATH ---
+        if 1 <= total_pcs <= 4:
+            inv_royalty = 20.00
+        elif total_pcs > 4:
+            inv_royalty = hm_pcs * 4.50
+        else:
+            inv_royalty = 0.00
+
+        total_monthly_royalty += inv_royalty
+
+        report_data.append({
+            "date": inv.created_at.strftime("%d-%m-%Y"),
+            "invoice_no": inv.bill_no or f"#00{inv.id}",
+            "customer_name": cust_name,
+            "request_nos": ", ".join(req_nos),
+            "total_pieces": total_pcs,
+            "hm_pieces": hm_pcs,
+            "royalty_amount": round(inv_royalty, 2)
+        })
+
+    # Final GST and Grand Total calculations
+    total_monthly_royalty = round(total_monthly_royalty, 2)
+    monthly_gst = round(total_monthly_royalty * 0.18, 2)
+    grand_total = round(total_monthly_royalty + monthly_gst, 2)
+
+    return {
+        "month_display": start_date.strftime("%B %Y"),
+        "report_data": report_data,
+        "total_royalty": total_monthly_royalty,
+        "gst_amount": monthly_gst,
+        "grand_total": grand_total
+    }
