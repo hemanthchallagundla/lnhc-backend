@@ -504,51 +504,56 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
         else:
             agg["remaining_pcs"] += inv_hm_pcs
 
-    report_data = []
-    overall_total_royalty = 0.0
-
-    # Sort alphabetically by party name
-    sorted_customers = sorted(customer_aggregates.values(), key=lambda x: x["party_name"])
-
-    for idx, agg in enumerate(sorted_customers, start=1):
-        amt = agg["amt"]
-        cgst = round(amt * 0.09, 2)
-        sgst = round(amt * 0.09, 2)
-        total = round(amt + cgst + sgst, 2)
-        
-        min_bills = agg["min_bills"]
-        remaining_pcs = agg["remaining_pcs"]
-        
-        royalty_min_bills = min_bills * 20.0
-        remaining_royalty = remaining_pcs * 4.50
-        total_royalty = royalty_min_bills + remaining_royalty
-        
-        overall_total_royalty += total_royalty
-        
-        report_data.append({
-            "sno": idx,
-            "party_name": agg["party_name"],
-            "pcs": agg["hm_pcs"],
-            "wt": round(agg["weight"], 3),
-            "amt": round(amt, 2),
-            "cgst": cgst,
-            "sgst": sgst,
-            "total": total,
-            "min_bills": min_bills,
-            "remaining_pcs": remaining_pcs,
-            "royalty_min_bills": round(royalty_min_bills, 2),
-            "remaining_royalty": round(remaining_royalty, 2),
-            "total_royalty": round(total_royalty, 2)
-        })
-
-    overall_total_royalty = round(overall_total_royalty, 2)
-    overall_gst = round(overall_total_royalty * 0.18, 2)
-    grand_total_royalty_gst = round(overall_total_royalty + overall_gst, 2)
-
-    return {
-        "month_display": start_date.strftime("%B %Y"),
-        "report_data": report_data,
-        "overall_total_royalty": overall_total_royalty,
-        "overall_gst": overall_gst,
-        "grand_total_royalty_gst": grand_total_royalty_gst
-    }
+        # ... (top half of generate_royalty_report stays the same) ...
+    
+        report_data = []
+        overall_total_royalty = 0.0
+    
+        # Sort alphabetically by party name
+        sorted_customers = sorted(customer_aggregates.values(), key=lambda x: x["party_name"])
+    
+        for idx, agg in enumerate(sorted_customers, start=1):
+            amt = agg["amt"]
+            
+            # FIXED: Zero out customer GST. Total bill is exactly the assaying amount.
+            cgst = 0.0
+            sgst = 0.0
+            total = round(amt, 2)
+            
+            min_bills = agg["min_bills"]
+            remaining_pcs = agg["remaining_pcs"]
+            
+            royalty_min_bills = min_bills * 20.0
+            remaining_royalty = remaining_pcs * 4.50
+            total_royalty = royalty_min_bills + remaining_royalty
+            
+            overall_total_royalty += total_royalty
+            
+            report_data.append({
+                "sno": idx,
+                "party_name": agg["party_name"],
+                "pcs": agg["hm_pcs"],
+                "wt": round(agg["weight"], 3),
+                "amt": round(amt, 2),
+                "cgst": cgst,
+                "sgst": sgst,
+                "total": total,
+                "min_bills": min_bills,
+                "remaining_pcs": remaining_pcs,
+                "royalty_min_bills": round(royalty_min_bills, 2),
+                "remaining_royalty": round(remaining_royalty, 2),
+                "total_royalty": round(total_royalty, 2)
+            })
+    
+        # You still pay 18% GST to the BIS on your total royalty pool
+        overall_total_royalty = round(overall_total_royalty, 2)
+        overall_gst = round(overall_total_royalty * 0.18, 2)
+        grand_total_royalty_gst = round(overall_total_royalty + overall_gst, 2)
+    
+        return {
+            "month_display": start_date.strftime("%B %Y"),
+            "report_data": report_data,
+            "overall_total_royalty": overall_total_royalty,
+            "overall_gst": overall_gst,
+            "grand_total_royalty_gst": grand_total_royalty_gst
+        }
