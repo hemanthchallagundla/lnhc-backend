@@ -449,18 +449,26 @@ from datetime import timedelta
 @app.get("/royalty_report/")
 def generate_royalty_report(month: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     try:
-        start_date = datetime.strptime(f"{month}-01", "%Y-%m-%d")
-        if start_date.month == 12:
-            end_date = start_date.replace(year=start_date.year+1, month=1, day=1) - timedelta(days=1)
+        # 1. Calculate the exact Start and End of the month in IST
+        start_date_ist = datetime.strptime(f"{month}-01", "%Y-%m-%d")
+        if start_date_ist.month == 12:
+            end_date_ist = start_date_ist.replace(year=start_date_ist.year+1, month=1, day=1) - timedelta(days=1)
         else:
-            end_date = start_date.replace(month=start_date.month+1, day=1) - timedelta(days=1)
-        end_date = end_date.replace(hour=23, minute=59, second=59)
+            end_date_ist = start_date_ist.replace(month=start_date_ist.month+1, day=1) - timedelta(days=1)
+        end_date_ist = end_date_ist.replace(hour=23, minute=59, second=59)
+
+        # 2. THE FIX: Convert IST boundaries to UTC to perfectly match the database!
+        ist_offset = timedelta(hours=5, minutes=30)
+        start_utc = start_date_ist - ist_offset
+        end_utc = end_date_ist - ist_offset
+
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid month format.")
 
+    # Search using the corrected UTC times
     invoices = db.query(database.Invoice).filter(
-        database.Invoice.created_at >= start_date,
-        database.Invoice.created_at <= end_date
+        database.Invoice.created_at >= start_utc,
+        database.Invoice.created_at <= end_utc
     ).all()
 
     customer_aggregates = {}
@@ -498,62 +506,59 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
         agg["weight"] += inv_weight
         agg["amt"] += inv_amt
         
-        # Split logic exactly like your CSV
         if inv_total_pcs <= 4:
             agg["min_bills"] += 1
         else:
             agg["remaining_pcs"] += inv_hm_pcs
 
-        # ... (top half of generate_royalty_report stays the same) ...
-    
-        report_data = []
-        overall_total_royalty = 0.0
-    
-        # Sort alphabetically by party name
-        sorted_customers = sorted(customer_aggregates.values(), key=lambda x: x["party_name"])
-    
-        for idx, agg in enumerate(sorted_customers, start=1):
-            amt = agg["amt"]
-            
-            # FIXED: Zero out customer GST. Total bill is exactly the assaying amount.
-            cgst = 0.0
-            sgst = 0.0
-            total = round(amt, 2)
-            
-            min_bills = agg["min_bills"]
-            remaining_pcs = agg["remaining_pcs"]
-            
-            royalty_min_bills = min_bills * 20.0
-            remaining_royalty = remaining_pcs * 4.50
-            total_royalty = royalty_min_bills + remaining_royalty
-            
-            overall_total_royalty += total_royalty
-            
-            report_data.append({
-                "sno": idx,
-                "party_name": agg["party_name"],
-                "pcs": agg["hm_pcs"],
-                "wt": round(agg["weight"], 3),
-                "amt": round(amt, 2),
-                "cgst": cgst,
-                "sgst": sgst,
-                "total": total,
-                "min_bills": min_bills,
-                "remaining_pcs": remaining_pcs,
-                "royalty_min_bills": round(royalty_min_bills, 2),
-                "remaining_royalty": round(remaining_royalty, 2),
-                "total_royalty": round(total_royalty, 2)
-            })
-    
-        # You still pay 18% GST to the BIS on your total royalty pool
-        overall_total_royalty = round(overall_total_royalty, 2)
-        overall_gst = round(overall_total_royalty * 0.18, 2)
-        grand_total_royalty_gst = round(overall_total_royalty + overall_gst, 2)
-    
-        return {
-            "month_display": start_date.strftime("%B %Y"),
-            "report_data": report_data,
-            "overall_total_royalty": overall_total_royalty,
-            "overall_gst": overall_gst,
-            "grand_total_royalty_gst": grand_total_royalty_gst
-        }
+    report_data = []
+    overall_total_royalty = 0.0
+
+    # Sort alphabetically by party name
+    sorted_customers = sorted(customer_aggregates.values(), key=lambda x: x["party_name"])
+
+    for idx, agg in enumerate(sorted_customers, start=1):
+        amt = agg["amt"]
+        
+        # Zeroed out Customer GST
+        cgst = 0.0
+        sgst = 0.0
+        total = round(amt, 2)
+        
+        min_bills = agg["min_bills"]
+        remaining_pcs = agg["remaining_pcs"]
+        
+        royalty_min_bills = min_bills * 20.0
+        remaining_royalty = remaining_pcs * 4.50
+        total_royalty = royalty_min_bills + remaining_royalty
+        
+        overall_total_royalty += total_royalty
+        
+        report_data.append({
+            "sno": idx,
+            "party_name": agg["party_name"],
+            "pcs": agg["hm_pcs"],
+            "wt": round(agg["weight"], 3),
+            "amt": round(amt, 2),
+            "cgst": cgst,
+            "sgst": sgst,
+            "total": total,
+            "min_bills": min_bills,
+            "remaining_pcs": remaining_pcs,
+            "royalty_min_bills": round(royalty_min_bills, 2),
+            "remaining_royalty": round(remaining_royalty, 2),
+            "total_royalty": round(total_royalty, 2)
+        })
+
+    # BIS 18% GST Logic
+    overall_total_royalty = round(overall_total_royalty, 2)
+    overall_gst = round(overall_total_royalty * 0.18, 2)
+    grand_total_royalty_gst = round(overall_total_royalty + overall_gst, 2)
+
+    return {
+        "month_display": start_date_ist.strftime("%B %Y"),
+        "report_data": report_data,
+        "overall_total_royalty": overall_total_royalty,
+        "overall_gst": overall_gst,
+        "grand_total_royalty_gst": grand_total_royalty_gst
+    }
