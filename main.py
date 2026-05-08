@@ -356,15 +356,49 @@ def print_invoice(invoice_identifier: str, db: Session = Depends(get_db), user: 
         "total_amount": round(invoice.total_amount or 0, 2), "items": item_list 
     }
 
-# --- REPORTS ---
+# --- TRACKING PORTAL (Public - No Auth Required) ---
+@app.get("/track/{identifier}")
+def track_job(identifier: str, db: Session = Depends(get_db)):
+    job = db.query(database.JobCard).filter(
+        (database.JobCard.request_number == identifier) | 
+        (database.JobCard.receipt_no == identifier)
+    ).first()
+    
+    if not job: raise HTTPException(status_code=404, detail="Request Number not found. Please check and try again.")
+    
+    customer = db.query(database.Customer).filter(database.Customer.id == job.customer_id).first()
+    items = db.query(database.JobItem).filter(database.JobItem.job_card_id == job.id).all()
+    
+    return {
+        "request_no": job.request_number,
+        "receipt_no": job.receipt_no,
+        "status": job.status, # Returns "Pending" or "Billed"
+        "customer": customer.business_name if customer else "Unknown",
+        "date": job.date_received.strftime("%d-%m-%Y"),
+        "total_items": sum(i.quantity for i in items)
+    }
+
+# --- REPORTS (WITH PAGINATION) ---
+import math
+
 @app.get("/report/{customer_id}")
-def generate_report(customer_id: int, start_date: str, end_date: str, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
+def generate_report(customer_id: int, start_date: str, end_date: str, page: int = 1, limit: int = 50, db: Session = Depends(get_db), user: database.AppUser = Depends(get_current_user)):
     start = datetime.strptime(start_date, "%Y-%m-%d"); end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
-    invoices = db.query(database.Invoice).filter(database.Invoice.customer_id == customer_id, database.Invoice.created_at >= start, database.Invoice.created_at <= end).order_by(database.Invoice.created_at.asc()).all()
+    
+    base_query = db.query(database.Invoice).filter(database.Invoice.customer_id == customer_id, database.Invoice.created_at >= start, database.Invoice.created_at <= end)
+    
+    total_records = base_query.count()
+    total_pages = math.ceil(total_records / limit) if total_records > 0 else 1
+    
+    invoices = base_query.order_by(database.Invoice.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
     customer = db.query(database.Customer).filter(database.Customer.id == customer_id).first()
     cust_name = customer.business_name if customer else "Unknown"
     
     report_data = []; grand_total = 0; total_pieces = 0
+    # Also calculate the true grand total across ALL pages for the top summary
+    all_invoices = base_query.all()
+    for inv in all_invoices: grand_total += inv.total_amount
+    
     for inv in invoices:
         jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == inv.id).all()
         req_nos = ", ".join([j.request_number for j in jobs if j.request_number])
@@ -375,15 +409,25 @@ def generate_report(customer_id: int, start_date: str, end_date: str, db: Sessio
         item_details_str = ", ".join(item_descriptions)
         bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
         report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
-        grand_total += inv.total_amount; total_pieces += pcs
-    return { "customer_name": cust_name, "report_data": report_data, "grand_total": round(grand_total, 2), "total_items": total_pieces }
+        total_pieces += pcs
+        
+    return { "customer_name": cust_name, "report_data": report_data, "grand_total": round(grand_total, 2), "page_items": total_pieces, "current_page": page, "total_pages": total_pages }
 
-# Notice: require_admin replaces get_current_user here! Master reports are for management.
 @app.get("/report_all/")
-def generate_master_report(start_date: str, end_date: str, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
+def generate_master_report(start_date: str, end_date: str, page: int = 1, limit: int = 50, db: Session = Depends(get_db), admin: database.AppUser = Depends(require_admin)):
     start = datetime.strptime(start_date, "%Y-%m-%d"); end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
-    invoices = db.query(database.Invoice).filter(database.Invoice.created_at >= start, database.Invoice.created_at <= end).order_by(database.Invoice.created_at.asc()).all()
+    
+    base_query = db.query(database.Invoice).filter(database.Invoice.created_at >= start, database.Invoice.created_at <= end)
+    
+    total_records = base_query.count()
+    total_pages = math.ceil(total_records / limit) if total_records > 0 else 1
+    
+    invoices = base_query.order_by(database.Invoice.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    
     report_data = []; grand_total = 0; total_pieces = 0
+    all_invoices = base_query.all()
+    for inv in all_invoices: grand_total += inv.total_amount
+    
     for inv in invoices:
         customer = db.query(database.Customer).filter(database.Customer.id == inv.customer_id).first()
         cust_name = customer.business_name if customer else "Unknown"
@@ -396,5 +440,6 @@ def generate_master_report(start_date: str, end_date: str, db: Session = Depends
         item_details_str = ", ".join(item_descriptions)
         bill_no_display = inv.bill_no if inv.bill_no else f"#00{inv.id}"
         report_data.append({"date": inv.created_at.strftime("%d-%m-%Y"), "invoice_no": bill_no_display, "request_no": req_nos, "customer_name": cust_name, "item_details": item_details_str, "pieces": pcs, "amount": round(inv.total_amount, 2)})
-        grand_total += inv.total_amount; total_pieces += pcs
-    return { "customer_name": "ALL JEWELERS (MASTER REPORT)", "report_data": report_data, "grand_total": round(grand_total, 2), "total_items": total_pieces }
+        total_pieces += pcs
+        
+    return { "customer_name": "ALL JEWELERS (MASTER REPORT)", "report_data": report_data, "grand_total": round(grand_total, 2), "page_items": total_pieces, "current_page": page, "total_pages": total_pages }
