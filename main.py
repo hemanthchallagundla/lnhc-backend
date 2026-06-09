@@ -1,3 +1,5 @@
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -8,6 +10,9 @@ from datetime import datetime, timedelta
 import database
 import secrets
 from fastapi.responses import Response
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI(title="Lakshmi Narasimha Hallmarking API")
 
@@ -24,13 +29,17 @@ def get_db():
     try: yield db
     finally: db.close()
 
-# --- STARTUP EVENT (Creates the Master Admin) ---
+# --- STARTUP EVENT (Creates the Master Admin securely) ---
 @app.on_event("startup")
 def startup_event():
     db = database.SessionLocal()
     admin_exists = db.query(database.AppUser).filter(database.AppUser.role == "admin").first()
     if not admin_exists:
-        default_admin = database.AppUser(username="admin", password="admin123", role="admin")
+        # Pull defaults from .env, or use temporary fallbacks if missing
+        admin_user = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
+        admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "changeme_immediately")
+        
+        default_admin = database.AppUser(username=admin_user, password=admin_pass, role="admin")
         db.add(default_admin)
         db.commit()
     db.close()
