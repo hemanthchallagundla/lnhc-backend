@@ -1,12 +1,26 @@
+import os
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
-SQLALCHEMY_DATABASE_URL = "postgresql://neondb_owner:npg_5qWFMUNe2QoE@ep-rough-smoke-a1bn3tx2-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+# Load environment variables from a .env file (if it exists)
+load_dotenv()
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True, pool_recycle=300, pool_size=5, max_overflow=10)
+# Fetch the secure database URL
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not SQLALCHEMY_DATABASE_URL:
+    raise ValueError("CRITICAL ERROR: DATABASE_URL environment variable is missing!")
+
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    pool_pre_ping=True,      
+    pool_recycle=300,        
+    pool_size=5,             
+    max_overflow=10          
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
 
 class AppUser(Base):
     __tablename__ = "app_users"
