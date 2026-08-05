@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
-# Load environment variables from a .env file (if it exists)
+# Load environment variables
 load_dotenv()
 
 # Fetch the secure database URL
@@ -48,17 +48,17 @@ class Invoice(Base):
     taxable_amount = Column(Float)
     total_amount = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow, index=True) 
-    bill_no = Column(String, index=True, nullable=True) 
+    bill_no = Column(String, unique=True, index=True, nullable=True) # UNIQUE LOCK APPLIED
 
 class JobCard(Base):
     __tablename__ = "job_cards"
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("customers.id")) 
     invoice_id = Column(Integer, ForeignKey("invoices.id"), index=True, nullable=True) 
-    request_number = Column(String, index=True, nullable=True)
+    request_number = Column(String, unique=True, index=True, nullable=True) # UNIQUE LOCK APPLIED
     status = Column(String, default="Pending") 
     date_received = Column(DateTime, default=datetime.utcnow, index=True) 
-    receipt_no = Column(String, index=True, nullable=True) 
+    receipt_no = Column(String, unique=True, index=True, nullable=True) # UNIQUE LOCK APPLIED
 
 class JobItem(Base):
     __tablename__ = "job_items"
