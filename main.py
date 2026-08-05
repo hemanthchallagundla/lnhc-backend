@@ -29,13 +29,11 @@ def get_db():
     try: yield db
     finally: db.close()
 
-# --- STARTUP EVENT (Creates the Master Admin securely) ---
 @app.on_event("startup")
 def startup_event():
     db = database.SessionLocal()
     admin_exists = db.query(database.AppUser).filter(database.AppUser.role == "admin").first()
     if not admin_exists:
-        # Pull defaults from .env, or use temporary fallbacks if missing
         admin_user = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
         admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "changeme_immediately")
         
@@ -186,10 +184,25 @@ def create_job_card(data: JobCardInput, db: Session = Depends(get_db), user: dat
 
     start_of_day = final_date_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = final_date_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
-    daily_count = db.query(database.JobCard).filter(database.JobCard.date_received >= start_of_day, database.JobCard.date_received <= end_of_day).count()
-    seq = daily_count + 1
     
+    last_job = db.query(database.JobCard).filter(
+        database.JobCard.date_received >= start_of_day, 
+        database.JobCard.date_received <= end_of_day
+    ).order_by(database.JobCard.id.desc()).first()
+
+    seq = 1
+    if last_job and last_job.receipt_no:
+        try:
+            last_seq = int(last_job.receipt_no.split('-')[-1])
+            seq = last_seq + 1
+        except Exception:
+            pass
+
     receipt_no_str = f"C-{display_date_ist.strftime('%d%m%Y')}-{seq}"
+    
+    while db.query(database.JobCard).filter(database.JobCard.receipt_no == receipt_no_str).first():
+        seq += 1
+        receipt_no_str = f"C-{display_date_ist.strftime('%d%m%Y')}-{seq}"
 
     new_job = database.JobCard(customer_id=data.customer_id, request_number=data.request_number, date_received=final_date_utc, receipt_no=receipt_no_str)
     db.add(new_job)
@@ -304,10 +317,25 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), user: 
     
     start_of_day = final_date_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = final_date_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
-    daily_count = db.query(database.Invoice).filter(database.Invoice.created_at >= start_of_day, database.Invoice.created_at <= end_of_day).count()
-    seq = daily_count + 1
-    bill_no_str = f"INV-{display_date_ist.strftime('%d%m%Y')}-{seq}"
+    
+    last_invoice = db.query(database.Invoice).filter(
+        database.Invoice.created_at >= start_of_day, 
+        database.Invoice.created_at <= end_of_day
+    ).order_by(database.Invoice.id.desc()).first()
 
+    seq = 1
+    if last_invoice and last_invoice.bill_no:
+        try:
+            last_seq = int(last_invoice.bill_no.split('-')[-1])
+            seq = last_seq + 1
+        except Exception:
+            pass
+
+    bill_no_str = f"INV-{display_date_ist.strftime('%d%m%Y')}-{seq}"
+    
+    while db.query(database.Invoice).filter(database.Invoice.bill_no == bill_no_str).first():
+        seq += 1
+        bill_no_str = f"INV-{display_date_ist.strftime('%d%m%Y')}-{seq}"
     total_pieces = 0
     for res in payload.results:
         db_item = db.query(database.JobItem).filter(database.JobItem.id == res.item_id).first()
