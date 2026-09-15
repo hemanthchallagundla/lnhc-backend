@@ -343,7 +343,7 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), user: 
             db_item.hm = res.hm; db_item.rej = res.rej; db_item.melt = res.melt; db_item.rtn = res.rtn
             total_pieces += db_item.quantity
             
-    calculated_amount = total_pieces * 75.0
+    calculated_amount = total_pieces * 45.0
     final_amount = max(calculated_amount, 200.0)
     
     new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount, created_at=final_date_utc, bill_no=bill_no_str)
@@ -550,7 +550,7 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
                 inv_weight += item.weight_grams
                 
         # Assaying Amount before GST
-        inv_amt = max(inv_total_pcs * 75.0, 200.0)
+        inv_amt = max(inv_total_pcs * 45.0, 200.0)
         
         agg["hm_pcs"] += inv_hm_pcs
         agg["weight"] += inv_weight
@@ -579,7 +579,7 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
         remaining_pcs = agg["remaining_pcs"]
         
         royalty_min_bills = min_bills * 20.0
-        remaining_royalty = remaining_pcs * 7.50
+        remaining_royalty = remaining_pcs * 4.50
         total_royalty = royalty_min_bills + remaining_royalty
         
         overall_total_royalty += total_royalty
