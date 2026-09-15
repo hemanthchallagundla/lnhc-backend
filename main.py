@@ -343,7 +343,14 @@ def generate_invoice(payload: BillPayload, db: Session = Depends(get_db), user: 
             db_item.hm = res.hm; db_item.rej = res.rej; db_item.melt = res.melt; db_item.rtn = res.rtn
             total_pieces += db_item.quantity
             
-    calculated_amount = total_pieces * 45.0
+    # --- NEW DYNAMIC CUTOFF PRICING LOGIC ---
+    cutoff_ist = datetime(2026, 9, 16, 10, 0, 0)
+    if display_date_ist >= cutoff_ist:
+        rate = 75.0
+    else:
+        rate = 45.0
+
+    calculated_amount = total_pieces * rate
     final_amount = max(calculated_amount, 200.0)
     
     new_invoice = database.Invoice(customer_id=payload.customer_id, service_description=f"Assaying & Hallmarking ({total_pieces} items)", taxable_amount=final_amount, total_amount=final_amount, created_at=final_date_utc, bill_no=bill_no_str)
@@ -388,11 +395,16 @@ def print_invoice(invoice_identifier: str, db: Session = Depends(get_db), user: 
         for i in items: item_list.append({"description": i.item_description, "purity": i.declared_purity, "quantity": i.quantity, "hm": i.hm, "rej": i.rej, "melt": i.melt, "rtn": i.rtn})
 
     bill_no_display = invoice.bill_no if invoice.bill_no else f"#00{invoice.id}"
+    invoice_ist_obj = invoice.created_at + timedelta(hours=5, minutes=30)
+    cutoff_ist = datetime(2026, 9, 16, 10, 0, 0)
+    rate_used = 75.0 if invoice_ist_obj >= cutoff_ist else 45.0
+
+    bill_no_display = invoice.bill_no if invoice.bill_no else f"#00{invoice.id}"
     return {
         "invoice_no": bill_no_display, "job_date_time": job_time_ist, "bill_date_time": bill_time_ist,
         "customer_name": customer.business_name or "Unknown", "customer_address": customer.address or "", 
         "customer_license": customer.license_number or "", "request_numbers": ", ".join(set(request_numbers)),
-        "total_amount": round(invoice.total_amount or 0, 2), "items": item_list 
+        "total_amount": round(invoice.total_amount or 0, 2), "rate": rate_used, "items": item_list 
     }
 
 # --- TRACKING PORTAL (Public - No Auth Required) ---
@@ -535,6 +547,7 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
                 "remaining_pcs": 0
             }
             
+        # ... inside your royalty_report loop
         agg = customer_aggregates[inv.customer_id]
         
         jobs = db.query(database.JobCard).filter(database.JobCard.invoice_id == inv.id).all()
@@ -549,17 +562,36 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
                 inv_hm_pcs += item.hm
                 inv_weight += item.weight_grams
                 
+        # --- DYNAMIC ROYALTY CUTOFF LOGIC ---
+        inv_ist = inv.created_at + timedelta(hours=5, minutes=30)
+        cutoff_ist = datetime(2026, 9, 16, 10, 0, 0)
+        
+        if inv_ist >= cutoff_ist:
+            rate = 75.0
+            royalty_rate = 7.50
+            min_pieces_threshold = 2  # (2pcs * 75 = 150, which is below 200 min bill)
+        else:
+            rate = 45.0
+            royalty_rate = 4.50
+            min_pieces_threshold = 4  # (4pcs * 45 = 180, which is below 200 min bill)
+                
         # Assaying Amount before GST
-        inv_amt = max(inv_total_pcs * 45.0, 200.0)
+        inv_amt = max(inv_total_pcs * rate, 200.0)
         
         agg["hm_pcs"] += inv_hm_pcs
         agg["weight"] += inv_weight
         agg["amt"] += inv_amt
         
-        if inv_total_pcs <= 4:
+        # Calculate Royalty Per Invoice so mixed months don't break
+        if inv_total_pcs <= min_pieces_threshold:
             agg["min_bills"] += 1
+            # Note: Minimum bill is always 200, so 10% royalty is always 20.0
+            if "royalty_min_bills" not in agg: agg["royalty_min_bills"] = 0.0
+            agg["royalty_min_bills"] += 20.0
         else:
             agg["remaining_pcs"] += inv_hm_pcs
+            if "remaining_royalty" not in agg: agg["remaining_royalty"] = 0.0
+            agg["remaining_royalty"] += (inv_hm_pcs * royalty_rate)
 
     report_data = []
     overall_total_royalty = 0.0
@@ -570,16 +602,9 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
     for idx, agg in enumerate(sorted_customers, start=1):
         amt = agg["amt"]
         
-        # Zeroed out Customer GST
-        cgst = 0.0
-        sgst = 0.0
-        total = round(amt, 2)
-        
-        min_bills = agg["min_bills"]
-        remaining_pcs = agg["remaining_pcs"]
-        
-        royalty_min_bills = min_bills * 20.0
-        remaining_royalty = remaining_pcs * 4.50
+        # Pull pre-calculated royalty amounts directly from aggregate
+        royalty_min_bills = agg.get("royalty_min_bills", 0.0)
+        remaining_royalty = agg.get("remaining_royalty", 0.0)
         total_royalty = royalty_min_bills + remaining_royalty
         
         overall_total_royalty += total_royalty
@@ -590,16 +615,15 @@ def generate_royalty_report(month: str, db: Session = Depends(get_db), user: dat
             "pcs": agg["hm_pcs"],
             "wt": round(agg["weight"], 3),
             "amt": round(amt, 2),
-            "cgst": cgst,
-            "sgst": sgst,
-            "total": total,
-            "min_bills": min_bills,
-            "remaining_pcs": remaining_pcs,
+            "cgst": 0.0,
+            "sgst": 0.0,
+            "total": round(amt, 2),
+            "min_bills": agg["min_bills"],
+            "remaining_pcs": agg["remaining_pcs"],
             "royalty_min_bills": round(royalty_min_bills, 2),
             "remaining_royalty": round(remaining_royalty, 2),
             "total_royalty": round(total_royalty, 2)
         })
-
     # BIS 18% GST Logic
     overall_total_royalty = round(overall_total_royalty, 2)
     overall_gst = round(overall_total_royalty * 0.18, 2)
